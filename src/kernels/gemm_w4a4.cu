@@ -2940,6 +2940,254 @@ void quantize_w4a4_act_fuse_lora(Tensor input, Tensor output, Tensor oscales, Te
     });
 }
 
+typedef __nv_bfloat16 half_t;
+
+void quantize_w4a4_act_fuse_lora_ops(half_t* input, uint8_t* output, half_t* oscales, half_t* lora_down, float* lora_act_out, half_t* smooth, int M , int N, int rank) {
+    using GEMM = GEMM_W4A4;
+    // using Lora = GEMM::Lora;
+
+    dim3 grid(M / GEMM::BLOCK_M, N / GEMM::BLOCK_N);
+
+    dispatchVal(rank, std::integer_sequence<int, 0, 32, 48, 64, 80, 96>(), [&]<int RANK>() {
+        using Lora = typename GEMM::Lora<RANK>;
+        using kernel = typename Lora::quantize_w4a4_fuse_lora_kernel;
+
+        auto func = invoke_kernel<kernel, typename kernel::Arguments>;
+
+        checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, kernel::SHMEM_SIZE));
+
+        func<<<grid, GEMM::WARP_SIZE * GEMM::NUM_WARPS, kernel::SHMEM_SIZE>>>(
+            typename kernel::Arguments{
+                .input = reinterpret_cast<GEMM::half_t*>(input),
+                .smooth_factor = reinterpret_cast<GEMM::packed_wscale_t*>(smooth),
+                .output = reinterpret_cast<GEMM::packed_act_t*>(output),
+                .oscales = reinterpret_cast<GEMM::packed_ascale_t*>(oscales),
+                .lora_wgt_down = reinterpret_cast<GEMM::packed_fpsum_t*>(lora_down),
+                .lora_act = lora_act_out,
+                .M = M,
+                .N = N,
+            }
+        );
+        checkCUDA(cudaGetLastError());
+    });
+}
+
+void gemm_w4a4_ops(
+        uint8_t* act,          // packed act [M, K / 2]
+        uint8_t* wgt,          // packed act [N, K / 2]
+        half_t* out,          // linear     [M, N]
+        uint8_t* qout,         // packed act [M, N / 2]
+        half_t* ascales,      // packed as  [K / 64, M]
+        half_t* wscales,      // packed ws  [K / 64, N]
+        half_t* oscales,      // packed as  [N / 64, M]
+        void* poolout,      // linear     [M / PoolSize, N]
+        float* lora_act_in,  // packed lora_act [M, R]
+        half_t* lora_up,      // packed lora_wgt [N, R]
+        half_t* lora_down,    // packed lora_wgt [N, R]
+        float* lora_act_out, // packed lora_act [M, R]
+        half_t* norm_q,       // linear     [HEAD_DIM]
+        half_t* norm_k,       // linear     [HEAD_DIM]
+        float* rotary_emb,   // linear     [M, HEAD_DIM / 2, 2, 2]
+        half_t* bias,         // packed ws  [N]
+        half_t* smooth_factor, // packed ws  [N], for quantization of the next layer
+        bool act_unsigned,
+        std::vector<float> lora_scales,  // [R / 16]
+        int M,
+        int N,
+        int K,
+        int lora_rank
+) {
+    using GEMM = GEMM_W4A4;
+
+    // (\w+)\.data_ptr<(.+)>\(\)
+    // reinterpret_cast<$2*>($1)
+
+    // int M = act.numel() / act.shape[-1];
+    // int N = wgt.shape[0];
+    // int K = act.shape[-1] * 2;
+    // assert(K == wgt.shape[1] * 2);
+
+    // spdlog::info("M={} N={} K={}", M, N, K);
+    // spdlog::info("act at {}", act.data_ptr());
+    // spdlog::info("wgt at {}", wgt.data_ptr());
+    // spdlog::info("ascales at {}", ascales.data_ptr());
+    // spdlog::info("wscales at {}", wscales.data_ptr());
+    // spdlog::info("bias at {}", bias.data_ptr());
+
+    auto launch = [&]<typename Epilogue>(Epilogue::Arguments args) {
+        dim3 grid(M / GEMM::BLOCK_M, N / GEMM::BLOCK_N);
+
+        bool swapBlockMN = M > N * 2;
+        if (swapBlockMN) {
+            std::swap(grid.x, grid.y);
+        }
+
+        dispatchBool(act_unsigned, [&]<bool ACT_UNSIGNED>() {
+            // test_sizeof<typename Epilogue::Arguments>();
+            // std::apply([](auto ...args) {
+            //     (test_sizeof<decltype(args)>(), ...);
+            // }, args);
+            invoke_kernel<GEMM::gemm_w4a4_kernel<Epilogue, ACT_UNSIGNED>><<<grid, GEMM::WARP_SIZE * GEMM::NUM_WARPS>>>(
+               reinterpret_cast<GEMM::packed_act_t*>(act),
+               reinterpret_cast<GEMM::packed_wgt_t*>(wgt),
+                reinterpret_cast<GEMM::packed_ascale_t*>(ascales),
+                reinterpret_cast<GEMM::packed_wscale_t*>(wscales),
+                // bias.valid() ? reinterpret_cast<GEMM::packed_wscale_t*>(bias) : nullptr,
+                reinterpret_cast<GEMM::half_t*>(out),
+                M, N, K,
+                args,
+                swapBlockMN,
+                false
+            );
+            checkCUDA(cudaGetLastError());
+        });
+    };
+
+    auto launch_bias = [&]<typename NextEpilogue>(NextEpilogue::Arguments nextArgs) {
+        if (bias == nullptr) {
+            return launch.template operator()<NextEpilogue>(nextArgs);
+        }
+
+        // assert(bias.numel() == N);
+
+        // append EpilgoueNop to workaround mismatched memory layout of std::tuple between device and host code on Windows
+        // ** sizeof(std::tuple<std::tuple<int>>) == 8 on device **
+        using Epilogue = GEMM::EpilogueCombination<GEMM::EpilogueBias, NextEpilogue, GEMM::EpilogueNop>;
+        return launch.template operator()<Epilogue>({
+            GEMM::EpilogueBias::Arguments{
+                .bias = reinterpret_cast<GEMM::packed_wscale_t*>(bias),
+            },
+            nextArgs,
+            {}
+        });
+    };
+    // auto launch_bias = launch;
+
+    auto launch_lora = [&]<typename NextEpilogue, typename MidEpilogue>(NextEpilogue::Arguments nextArgs, MidEpilogue::Arguments midArgs) {
+        // assert(lora_up.valid() == lora_act_in.valid());
+        // assert(lora_down.valid() == lora_act_out.valid());
+
+        if (lora_up == nullptr) {
+            assert(lora_down == nullptr);
+            return launch_bias.template operator()<GEMM::EpilogueCombination<MidEpilogue, NextEpilogue>>({midArgs, nextArgs});
+        }
+
+        // const int rank_up = lora_up.shape[1];
+
+        // assert(lora_up.shape[0] == N);
+        // // assert(lora_up.shape[1] == Lora::LORA_RANK);
+        // assert(lora_act_in.shape[0] == M);
+        // assert(lora_act_in.shape[1] == rank_up);
+
+        dispatchVal(lora_rank, std::integer_sequence<int, 0, 32, 48, 64, 80, 96>(), [&]<int RANK_UP>() {
+            using LoraUp = GEMM::Lora<RANK_UP>;
+            using scale_t = typename LoraUp::scale_t;
+
+            scale_t scales;
+            if constexpr (scales.size() > 0) {
+                assert(lora_scales.size() >= scales.size());
+                for (size_t i = 0; i < scales.size(); i++) {
+                    scales[i] = lora_scales[i];
+                }
+            }
+
+            if (lora_down == nullptr) {
+                using Epilogue = typename GEMM::EpilogueCombination<typename LoraUp::EpilogueLoraUp, MidEpilogue, NextEpilogue, GEMM::EpilogueNop>;
+                return launch_bias.template operator()<Epilogue>({
+                    typename LoraUp::EpilogueLoraUp::Arguments{
+                        .lora_act = reinterpret_cast<float*>(lora_act_in),
+                        .lora_wgt_up = reinterpret_cast<GEMM::packed_fpsum_t*>(lora_up),
+                        .scales = scales,
+                    },
+                    midArgs,
+                    nextArgs,
+                    {}
+                });
+            }
+
+            // const int rank_down = lora_down.shape[1];
+
+            // assert(rank_down == rank_up);
+
+            // assert(lora_down.shape[0] == N);
+            // // assert(lora_down.shape[1] == Lora::LORA_RANK);
+            // assert(lora_act_out.shape[0] == M);
+            // assert(lora_act_out.shape[1] == rank_down);
+
+            // lora_act_out.zero_();
+
+            // dispatchVal(rank_down, std::integer_sequence<int, 16, 32, 48, 64, 80>(), [&]<int RANK_DOWN>() {
+
+            using LoraDown = LoraUp; // GEMM::Lora<RANK_DOWN>;
+            using Epilogue = GEMM::EpilogueCombination<typename LoraUp::EpilogueLoraUp, MidEpilogue, typename LoraDown::EpilogueLoraDown, NextEpilogue, GEMM::EpilogueNop>;
+            return launch_bias.template operator()<Epilogue>({
+                typename LoraUp::EpilogueLoraUp::Arguments{
+                    .lora_act = reinterpret_cast<float*>(lora_act_in),
+                    .lora_wgt_up = reinterpret_cast<GEMM::packed_fpsum_t*>(lora_up),
+                    .scales = scales,
+                },
+                midArgs,
+                typename LoraDown::EpilogueLoraDown::Arguments{
+                    .lora_wgt_down = reinterpret_cast<GEMM::packed_fpsum_t*>(lora_down),
+                    .lora_act = reinterpret_cast<float*>(lora_act_out),
+                },
+                nextArgs,
+                {}
+            });
+
+            // });
+        });
+    };
+
+    if (qout != nullptr && oscales != nullptr) {
+
+        // dispatchBool(qout_unsigned, [&]<bool USE_UNSIGNED>() {
+
+        static constexpr float SHIFT_GELU = 0.171875f;
+
+
+        constexpr bool USE_UNSIGNED = true;
+        using EpilogueQuantize = typename GEMM::EpilogueQuantize<false, USE_UNSIGNED>;
+        auto argsQuantize = typename EpilogueQuantize::Arguments{
+            .qout = reinterpret_cast<GEMM::packed_act_t*>(qout),
+            .oscales = reinterpret_cast<GEMM::packed_ascale_t*>(oscales),
+            .shift_value = SHIFT_GELU,
+            .smooth_factor = reinterpret_cast<GEMM::packed_wscale_t*>(smooth_factor)
+        };
+
+        // TODO: check if gelu is needed
+        if (out != nullptr) {
+            launch_lora.template operator()<GEMM::EpilogueCombination<GEMM::EpilogueDefault, EpilogueQuantize>, GEMM::EpilogueGelu>({
+                GEMM::EpilogueDefault::Arguments{},
+                argsQuantize
+            }, {});
+        } else {
+            launch_lora.template operator()<EpilogueQuantize, GEMM::EpilogueGelu>(argsQuantize, {});
+        }
+
+        // });
+        
+    } else if (rotary_emb != nullptr) {
+        // assert(norm_q.valid());
+        // assert(norm_k.valid());
+        // assert(isTypeMatch<GEMM::half_t>(rotary_emb.scalar_type()));
+        // assert(rotary_emb.scalar_type() == Tensor::FP32);
+        // assert(rotary_emb.numel() == M * GEMM::EpilogueQKVProj::HEAD_DIM / 2 * GEMM::EpilogueQKVProj::ROTARY_EMB_NUM_ELEMENTS);
+        launch_lora.template operator()<GEMM::EpilogueQKVProj, GEMM::EpilogueNop>(GEMM::EpilogueQKVProj::Arguments{
+            .pool_out = reinterpret_cast<GEMM::half_t*>(poolout),
+            .rotary_emb = reinterpret_cast<float*>(rotary_emb),
+            .rmsnorm_weight_q = reinterpret_cast<GEMM::half_t*>(norm_q),
+            .rmsnorm_weight_k = reinterpret_cast<GEMM::half_t*>(norm_k),
+            .epsilon = 1e-6,
+        }, {});
+    } else if (out != nullptr) {
+        launch_lora.template operator()<GEMM::EpilogueDefault, GEMM::EpilogueNop>({}, {});
+    } else {
+        assert(false);
+    }
+}
+
+
 void quantize_w4a4_act(Tensor input, Tensor output, Tensor oscales) {
     using GEMM = GEMM_W4A4;
 

@@ -314,3 +314,43 @@ Tensor gemv_awq(
     
     return _out_feats;
 }
+
+void gemv_awq_ops(
+    half_t* in_feats,
+    uint32_t* kernel,
+    half_t* scaling_factors,
+    half_t* zeros,
+    int m,
+    int n,
+    int k,
+    int group_size,
+    half_t * out_feats)
+{
+    using half_t = __nv_bfloat16;
+    // using half_t = half;
+
+    static constexpr int N_PER_BLOCK = 2;
+    static constexpr int K_INTERLEAVE = 4;
+    static constexpr int BLOCK_SIZE = 256;
+
+    dim3 num_blocks(n / N_PER_BLOCK / K_INTERLEAVE);
+    dim3 num_threads(BLOCK_SIZE);
+
+    constexpr int GROUP_SIZE = 64;
+
+    assert(m > 0 && m < 8);
+    assert(group_size == GROUP_SIZE);
+
+    dispatchVal(m, std::make_integer_sequence<int, 8>(), [&]<int M>() {
+        if constexpr (M == 0) {
+            assert(false);
+            return;
+        }
+        if constexpr (M > 0) {
+            gemv_kernel<half_t, N_PER_BLOCK, M, BLOCK_SIZE, GROUP_SIZE><<<num_blocks, num_threads>>>(
+                in_feats, kernel, scaling_factors, zeros, out_feats, k, n
+            );
+            checkCUDA(cudaGetLastError());
+        }
+    });
+}

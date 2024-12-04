@@ -200,6 +200,14 @@ struct TensorShape {
             ss << ", " << dataExtent[i];
         }
         ss << "]";
+        if (!dataStride.empty()) {
+            ss << " Stride [" << dataStride[0];
+            for (size_t i = 1; i < dataStride.size(); i++) {
+                ss << ", " << dataStride[i];
+            }
+            ss << "]";
+        }
+        ss << " offset " << offset;
         return ss.str();
     }
 };
