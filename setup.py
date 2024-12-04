@@ -1,5 +1,3 @@
-import os
-
 import setuptools
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
@@ -20,21 +18,10 @@ class CustomBuildExtension(BuildExtension):
 
 
 if __name__ == "__main__":
-    fp = open("nunchaku/__version__.py", "r").read()
+    fp = open("nunchaku_ops/__version__.py", "r").read()
     version = eval(fp.strip().split()[-1])
 
-    ROOT_DIR = os.path.dirname(__file__)
-
-    INCLUDE_DIRS = [
-        "src",
-        "third_party/cutlass/include",
-        "third_party/json/include",
-        "third_party/mio/include",
-        "third_party/spdlog/include",
-        "third_party/Block-Sparse-Attention/csrc/block_sparse_attn",
-    ]
-
-    INCLUDE_DIRS = [ROOT_DIR + "/" + dir for dir in INCLUDE_DIRS]
+    INCLUDE_DIRS = []
 
     DEBUG = False
 
@@ -103,14 +90,11 @@ if __name__ == "__main__":
     NVCC_MSVC_FLAGS = ["-Xcompiler", "/Zc:__cplusplus"]
 
     nunchaku_operators_extension = CUDAExtension(
-        name="nunchaku._C",
+        name="nunchaku_ops._C",
         sources=[
-            "nunchaku/csrc/operators.cpp",
-            "src/interop/torch.cpp",
-            "src/kernels/gemm_w4a4.cu",
-            # "src/kernels/gemm_batched.cu",
-            # "src/kernels/gemm_f16.cu",
-            "src/kernels/awq/gemv_awq.cu",
+            "nunchaku_ops/csrc/operators.cpp",
+            "nunchaku_ops/csrc/kernels/gemm_w4a4.cu",
+            "nunchaku_ops/csrc/kernels/awq/gemv_awq.cu",
         ],
         extra_compile_args={
             "gcc": GCC_FLAGS,
@@ -122,7 +106,7 @@ if __name__ == "__main__":
     )
 
     setuptools.setup(
-        name="nunchaku",
+        name="nunchaku_ops",
         version=version,
         packages=setuptools.find_packages(),
         ext_modules=[nunchaku_operators_extension],

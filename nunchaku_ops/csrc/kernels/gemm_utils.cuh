@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include "common.h"
 #include "utils.cuh"
 
 static constexpr int clamp(int val, int min, int max) {

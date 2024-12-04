@@ -31,12 +31,13 @@
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
-#include <stdio.h>
 #include "dequantize.cuh"
 
 #define PACK_FACTOR 8
 #define WARP_SIZE 32
 #define MEM_ACCESS_SIZE 128
+
+#define checkCUDA(retValue) retValue
 
 // Reduce sum within the warp using the tree reduction algorithm.
 template <typename float_t, int Num, int WarpSize>
@@ -257,64 +258,8 @@ Args:
   _scaling_factors: tensor of shape [OC, IC // G];
   blockDim_x: size of thread block, dimension x, where blockDim_x * workload_per_thread = IC;
   blockDim_y: size of thread block, dimension y, where blockDim_y * gridDim_y = OC;
-
-Returns:
   out_feats: tensor of shape [B, OC];
 */
-Tensor gemv_awq(
-    Tensor _in_feats,
-    Tensor _kernel,
-    Tensor _scaling_factors,
-    Tensor _zeros,
-    int m,
-    int n,
-    int k,
-    int group_size)
-{
-    using half_t = __nv_bfloat16;
-    // using half_t = half;
-
-    assert(isTypeMatch<half_t>(_in_feats.dtype()));
-
-    auto output_shape = _in_feats.shape.dataExtent;
-    output_shape.back() = n;
-
-    auto in_feats = reinterpret_cast<half_t*>(_in_feats.data_ptr<half_t>());
-    auto kernel = reinterpret_cast<uint32_t*>(_kernel.data_ptr());
-    auto zeros = reinterpret_cast<half_t*>(_zeros.data_ptr<half_t>());
-    auto scaling_factors = reinterpret_cast<half_t*>(_scaling_factors.data_ptr<half_t>());
-
-    Tensor _out_feats = Tensor::allocate(output_shape, _in_feats.dtype(), _in_feats.device());
-    half_t * out_feats = reinterpret_cast<half_t *>(_out_feats.data_ptr());
-    
-    static constexpr int N_PER_BLOCK = 2;
-    static constexpr int K_INTERLEAVE = 4;
-    static constexpr int BLOCK_SIZE = 256;
-
-    dim3 num_blocks(n / N_PER_BLOCK / K_INTERLEAVE);
-    dim3 num_threads(BLOCK_SIZE);
-
-    constexpr int GROUP_SIZE = 64;
-
-    assert(m > 0 && m < 8);
-    assert(group_size == GROUP_SIZE);
-
-    dispatchVal(m, std::make_integer_sequence<int, 8>(), [&]<int M>() {
-        if constexpr (M == 0) {
-            assert(false);
-            return;
-        }
-        if constexpr (M > 0) {
-            gemv_kernel<half_t, N_PER_BLOCK, M, BLOCK_SIZE, GROUP_SIZE><<<num_blocks, num_threads>>>(
-                in_feats, kernel, scaling_factors, zeros, out_feats, k, n
-            );
-            checkCUDA(cudaGetLastError());
-        }
-    });
-    
-    return _out_feats;
-}
-
 void gemv_awq_ops(
     half_t* in_feats,
     uint32_t* kernel,
